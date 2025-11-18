@@ -87,7 +87,7 @@ pub fn rng_with_seed(seed: &[u8]) -> StdRng {
 /// The parent hash of the first header
 /// in the result will be equal to `head`.
 ///
-/// The headers are assumed to not be correct if validated.
+/// The headers are assumed not to be correct if validated.
 pub fn random_header_range<R: Rng>(
     rng: &mut R,
     range: Range<u64>,
@@ -118,7 +118,7 @@ pub fn random_block_with_parent<R: Rng>(
 
 /// Generate a random [`SealedHeader`].
 ///
-/// The header is assumed to not be correct if validated.
+/// The header is assumed not to be correct if validated.
 pub fn random_header<R: Rng>(rng: &mut R, number: u64, parent: Option<B256>) -> SealedHeader {
     let header = alloy_consensus::Header {
         number,
@@ -529,7 +529,7 @@ mod tests {
     #[test]
     fn test_sign_eip_155() {
         // reference: https://github.com/ethereum/EIPs/blob/master/EIPS/eip-155.md#example
-        let transaction = Transaction::Legacy(TxLegacy {
+        let tx = TxLegacy {
             chain_id: Some(1),
             nonce: 9,
             gas_price: 20 * 10_u128.pow(9),
@@ -537,12 +537,11 @@ mod tests {
             to: TxKind::Call(hex!("3535353535353535353535353535353535353535").into()),
             value: U256::from(10_u128.pow(18)),
             input: Bytes::default(),
-        });
+        };
+        let transaction = Transaction::Legacy(tx.clone());
 
-        // TODO resolve dependency issue
-        // let expected =
-        // hex!("ec098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a764000080018080");
-        // assert_eq!(expected, &alloy_rlp::encode(transaction));
+        let expected = hex!("ec098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a764000080018080");
+        assert_eq!(expected.as_slice(), &alloy_rlp::encode(tx));
 
         let hash = transaction.signature_hash();
         let expected =

@@ -8,12 +8,11 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
-use crate::alloc::string::ToString;
 use alloy_primitives::Bytes;
 use reth_chainspec::EthereumHardforks;
 use reth_primitives_traits::{NodePrimitives, SealedBlock};
@@ -26,8 +25,8 @@ pub use error::{
 
 mod traits;
 pub use traits::{
-    BuildNextEnv, BuiltPayload, PayloadAttributes, PayloadAttributesBuilder,
-    PayloadBuilderAttributes,
+    BuildNextEnv, BuiltPayload, BuiltPayloadExecutedBlock, PayloadAttributes,
+    PayloadAttributesBuilder, PayloadBuilderAttributes,
 };
 
 mod payload;
@@ -71,6 +70,7 @@ pub trait PayloadTypes: Send + Sync + Unpin + core::fmt::Debug + Clone + 'static
 /// * If V2, this ensures that the payload timestamp is pre-Cancun.
 /// * If V3, this ensures that the payload timestamp is within the Cancun timestamp.
 /// * If V4, this ensures that the payload timestamp is within the Prague timestamp.
+/// * If V5, this ensures that the payload timestamp is within the Osaka timestamp.
 ///
 /// Otherwise, this will return [`EngineObjectValidationError::UnsupportedFork`].
 pub fn validate_payload_timestamp(
@@ -462,21 +462,19 @@ pub fn validate_execution_requests(requests: &[Bytes]) -> Result<(), EngineObjec
     let mut last_request_type = None;
     for request in requests {
         if request.len() <= 1 {
-            return Err(EngineObjectValidationError::InvalidParams(
-                "EmptyExecutionRequest".to_string().into(),
-            ))
+            return Err(EngineObjectValidationError::InvalidParams("EmptyExecutionRequest".into()))
         }
 
         let request_type = request[0];
         if Some(request_type) < last_request_type {
             return Err(EngineObjectValidationError::InvalidParams(
-                "OutOfOrderExecutionRequest".to_string().into(),
+                "OutOfOrderExecutionRequest".into(),
             ))
         }
 
         if Some(request_type) == last_request_type {
             return Err(EngineObjectValidationError::InvalidParams(
-                "DuplicatedExecutionRequestType".to_string().into(),
+                "DuplicatedExecutionRequestType".into(),
             ))
         }
 
@@ -521,7 +519,7 @@ mod tests {
         let mut requests_valid_reversed = valid_requests;
         requests_valid_reversed.reverse();
         assert_matches!(
-            validate_execution_requests(&requests_with_empty),
+            validate_execution_requests(&requests_valid_reversed),
             Err(EngineObjectValidationError::InvalidParams(_))
         );
 

@@ -14,7 +14,7 @@ use std::borrow::Cow;
 /// This type allows runtime selection between different sparse trie implementations,
 /// providing flexibility in choosing the appropriate implementation based on workload
 /// characteristics.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum ConfiguredSparseTrie {
     /// Serial implementation of the sparse trie.
     Serial(Box<SerialSparseTrie>),
@@ -170,6 +170,19 @@ impl SparseTrieInterface for ConfiguredSparseTrie {
         match self {
             Self::Serial(trie) => trie.updates_ref(),
             Self::Parallel(trie) => trie.updates_ref(),
+        }
+    }
+    fn shrink_nodes_to(&mut self, size: usize) {
+        match self {
+            Self::Serial(trie) => trie.shrink_nodes_to(size),
+            Self::Parallel(trie) => trie.shrink_nodes_to(size),
+        }
+    }
+
+    fn shrink_values_to(&mut self, size: usize) {
+        match self {
+            Self::Serial(trie) => trie.shrink_values_to(size),
+            Self::Parallel(trie) => trie.shrink_values_to(size),
         }
     }
 }

@@ -335,12 +335,12 @@ impl<T: PoolTransaction> ValidPoolTransaction<T> {
     }
 
     /// Returns the internal identifier for the sender of this transaction
-    pub(crate) const fn sender_id(&self) -> SenderId {
+    pub const fn sender_id(&self) -> SenderId {
         self.transaction_id.sender
     }
 
     /// Returns the internal identifier for this transaction.
-    pub(crate) const fn id(&self) -> &TransactionId {
+    pub const fn id(&self) -> &TransactionId {
         &self.transaction_id
     }
 
@@ -515,7 +515,7 @@ impl<T: PoolTransaction> fmt::Debug for ValidPoolTransaction<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ValidPoolTransaction")
             .field("id", &self.transaction_id)
-            .field("pragate", &self.propagate)
+            .field("propagate", &self.propagate)
             .field("origin", &self.origin)
             .field("hash", self.transaction.hash())
             .field("tx", &self.transaction)

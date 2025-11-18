@@ -61,13 +61,29 @@ impl<N: NodePrimitives> StaticFileWriters<N> {
     }
 
     pub(crate) fn commit(&self) -> ProviderResult<()> {
+        debug!(target: "provider::static_file", "Committing all static file segments");
+
         for writer_lock in [&self.headers, &self.transactions, &self.receipts] {
             let mut writer = writer_lock.write();
             if let Some(writer) = writer.as_mut() {
                 writer.commit()?;
             }
         }
+
+        debug!(target: "provider::static_file", "Committed all static file segments");
         Ok(())
+    }
+
+    pub(crate) fn has_unwind_queued(&self) -> bool {
+        for writer_lock in [&self.headers, &self.transactions, &self.receipts] {
+            let writer = writer_lock.read();
+            if let Some(writer) = writer.as_ref() &&
+                writer.will_prune_on_commit()
+            {
+                return true
+            }
+        }
+        false
     }
 }
 
@@ -149,8 +165,8 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
 
         let static_file_provider = Self::upgrade_provider_to_strong_reference(&reader);
 
-        let block_range = static_file_provider.find_fixed_range(block);
-        let (jar, path) = match static_file_provider.get_segment_provider_from_block(
+        let block_range = static_file_provider.find_fixed_range(segment, block);
+        let (jar, path) = match static_file_provider.get_segment_provider_for_block(
             segment,
             block_range.start(),
             None,
@@ -201,10 +217,19 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         } else {
             self.user_header().tx_len().unwrap_or_default()
         };
-        let pruned_rows = expected_rows - self.writer.rows() as u64;
+        let actual_rows = self.writer.rows() as u64;
+        let pruned_rows = expected_rows.saturating_sub(actual_rows);
         if pruned_rows > 0 {
             self.user_header_mut().prune(pruned_rows);
         }
+
+        debug!(
+            target: "provider::static_file",
+            segment = ?self.writer.user_header().segment(),
+            path = ?self.data_path,
+            pruned_rows,
+            "Ensuring end range consistency"
+        );
 
         self.writer.commit().map_err(ProviderError::other)?;
 
@@ -213,12 +238,23 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         Ok(())
     }
 
+    /// Returns `true` if the writer will prune on commit.
+    pub const fn will_prune_on_commit(&self) -> bool {
+        self.prune_on_commit.is_some()
+    }
+
     /// Commits configuration changes to disk and updates the reader index with the new changes.
     pub fn commit(&mut self) -> ProviderResult<()> {
         let start = Instant::now();
 
         // Truncates the data file if instructed to.
         if let Some((to_delete, last_block_number)) = self.prune_on_commit.take() {
+            debug!(
+                target: "provider::static_file",
+                segment = ?self.writer.user_header().segment(),
+                to_delete,
+                "Pruning data on commit"
+            );
             match self.writer.user_header().segment() {
                 StaticFileSegment::Headers => self.prune_header_data(to_delete)?,
                 StaticFileSegment::Transactions => self
@@ -230,6 +266,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
         }
 
         if self.writer.is_dirty() {
+            debug!(
+                target: "provider::static_file",
+                segment = ?self.writer.user_header().segment(),
+                "Committing writer to disk"
+            );
+
             // Commits offsets and new user_header to disk
             self.writer.commit().map_err(ProviderError::other)?;
 
@@ -246,7 +288,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 segment = ?self.writer.user_header().segment(),
                 path = ?self.data_path,
                 duration = ?start.elapsed(),
-                "Commit"
+                "Committed writer to disk"
             );
 
             self.update_index()?;
@@ -261,6 +303,12 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     #[cfg(feature = "test-utils")]
     pub fn commit_without_sync_all(&mut self) -> ProviderResult<()> {
         let start = Instant::now();
+
+        debug!(
+            target: "provider::static_file",
+            segment = ?self.writer.user_header().segment(),
+            "Committing writer to disk (without sync)"
+        );
 
         // Commits offsets and new user_header to disk
         self.writer.commit_without_sync_all().map_err(ProviderError::other)?;
@@ -278,7 +326,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
             segment = ?self.writer.user_header().segment(),
             path = ?self.data_path,
             duration = ?start.elapsed(),
-            "Commit"
+            "Committed writer to disk (without sync)"
         );
 
         self.update_index()?;
@@ -333,7 +381,7 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
                 self.data_path = data_path;
 
                 *self.writer.user_header_mut() = SegmentHeader::new(
-                    self.reader().find_fixed_range(last_block + 1),
+                    self.reader().find_fixed_range(segment, last_block + 1),
                     None,
                     None,
                     segment,
@@ -513,7 +561,20 @@ impl<N: NodePrimitives> StaticFileProviderRW<N> {
     /// blocks.
     ///
     /// Returns the current [`BlockNumber`] as seen in the static file.
-    pub fn append_header(
+    pub fn append_header(&mut self, header: &N::BlockHeader, hash: &BlockHash) -> ProviderResult<()>
+    where
+        N::BlockHeader: Compact,
+    {
+        self.append_header_with_td(header, U256::ZERO, hash)
+    }
+
+    /// Appends header to static file with a specified total difficulty.
+    ///
+    /// It **CALLS** `increment_block()` since the number of headers is equal to the number of
+    /// blocks.
+    ///
+    /// Returns the current [`BlockNumber`] as seen in the static file.
+    pub fn append_header_with_td(
         &mut self,
         header: &N::BlockHeader,
         total_difficulty: U256,

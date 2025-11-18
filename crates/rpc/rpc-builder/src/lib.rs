@@ -17,7 +17,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use crate::{auth::AuthRpcModule, error::WsHttpSamePortError, metrics::RpcRequestMetrics};
 use alloy_network::{Ethereum, IntoWallet};
@@ -34,7 +34,7 @@ use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_evm::ConfigureEvm;
 use reth_network_api::{noop::NoopNetwork, NetworkInfo, Peers};
-use reth_primitives_traits::NodePrimitives;
+use reth_primitives_traits::{NodePrimitives, TxTy};
 use reth_rpc::{
     AdminApi, DebugApi, EngineEthApi, EthApi, EthApiBuilder, EthBundle, MinerApi, NetApi,
     OtterscanApi, RPCApi, RethApi, TraceApi, TxPoolApi, ValidationApiConfig, Web3Api,
@@ -99,7 +99,7 @@ pub use eth::EthHandlers;
 // Rpc server metrics
 mod metrics;
 use crate::middleware::RethRpcMiddleware;
-pub use metrics::{MeteredRequestFuture, RpcRequestMetricsService};
+pub use metrics::{MeteredBatchRequestsFuture, MeteredRequestFuture, RpcRequestMetricsService};
 use reth_chain_state::CanonStateSubscriptions;
 use reth_rpc::eth::sim_bundle::EthSimBundle;
 
@@ -310,7 +310,7 @@ where
         + CanonStateSubscriptions<Primitives = N>
         + AccountReader
         + ChangeSetReader,
-    Pool: TransactionPool + 'static,
+    Pool: TransactionPool + Clone + 'static,
     Network: NetworkInfo + Peers + Clone + 'static,
     EvmConfig: ConfigureEvm<Primitives = N> + 'static,
     Consensus: FullConsensus<N, Error = ConsensusError> + Clone + 'static,
@@ -453,7 +453,7 @@ pub struct RpcModuleConfigBuilder {
 
 impl RpcModuleConfigBuilder {
     /// Configures a custom eth namespace config
-    pub const fn eth(mut self, eth: EthConfig) -> Self {
+    pub fn eth(mut self, eth: EthConfig) -> Self {
         self.eth = Some(eth);
         self
     }
@@ -547,7 +547,7 @@ where
     {
         let blocking_pool_guard = BlockingTaskGuard::new(config.eth.max_tracing_requests);
 
-        let eth = EthHandlers::bootstrap(config.eth, executor.clone(), eth_api);
+        let eth = EthHandlers::bootstrap(config.eth.clone(), executor.clone(), eth_api);
 
         Self {
             provider,
@@ -619,11 +619,12 @@ where
     EvmConfig: ConfigureEvm,
 {
     /// Instantiates `AdminApi`
-    pub fn admin_api(&self) -> AdminApi<Network, Provider::ChainSpec>
+    pub fn admin_api(&self) -> AdminApi<Network, Provider::ChainSpec, Pool>
     where
         Network: Peers,
+        Pool: TransactionPool + Clone + 'static,
     {
-        AdminApi::new(self.network.clone(), self.provider.chain_spec())
+        AdminApi::new(self.network.clone(), self.provider.chain_spec(), self.pool.clone())
     }
 
     /// Instantiates `Web3Api`
@@ -635,6 +636,7 @@ where
     pub fn register_admin(&mut self) -> &mut Self
     where
         Network: Peers,
+        Pool: TransactionPool + Clone + 'static,
     {
         let adminapi = self.admin_api();
         self.modules.insert(RethRpcModule::Admin, adminapi.into_rpc().into());
@@ -668,6 +670,7 @@ where
             RpcBlock<EthApi::NetworkTypes>,
             RpcReceipt<EthApi::NetworkTypes>,
             RpcHeader<EthApi::NetworkTypes>,
+            TxTy<N>,
         > + EthApiTypes,
     EvmConfig: ConfigureEvm<Primitives = N> + 'static,
 {
@@ -689,7 +692,7 @@ where
     /// If called outside of the tokio runtime. See also [`Self::eth_api`]
     pub fn register_ots(&mut self) -> &mut Self
     where
-        EthApi: TraceExt + EthTransactions,
+        EthApi: TraceExt + EthTransactions<Primitives = N>,
     {
         let otterscan_api = self.otterscan_api();
         self.modules.insert(RethRpcModule::Ots, otterscan_api.into_rpc().into());
@@ -786,7 +789,11 @@ where
     ///
     /// If called outside of the tokio runtime. See also [`Self::eth_api`]
     pub fn trace_api(&self) -> TraceApi<EthApi> {
-        TraceApi::new(self.eth_api().clone(), self.blocking_pool_guard.clone(), self.eth_config)
+        TraceApi::new(
+            self.eth_api().clone(),
+            self.blocking_pool_guard.clone(),
+            self.eth_config.clone(),
+        )
     }
 
     /// Instantiates [`EthBundle`] Api
@@ -838,7 +845,7 @@ where
         + CanonStateSubscriptions<Primitives = N>
         + AccountReader
         + ChangeSetReader,
-    Pool: TransactionPool + 'static,
+    Pool: TransactionPool + Clone + 'static,
     Network: NetworkInfo + Peers + Clone + 'static,
     EthApi: FullEthApiServer,
     EvmConfig: ConfigureEvm<Primitives = N> + 'static,
@@ -915,16 +922,17 @@ where
         let namespaces: Vec<_> = namespaces.collect();
         namespaces
             .iter()
-            .copied()
             .map(|namespace| {
                 self.modules
-                    .entry(namespace)
-                    .or_insert_with(|| match namespace {
-                        RethRpcModule::Admin => {
-                            AdminApi::new(self.network.clone(), self.provider.chain_spec())
-                                .into_rpc()
-                                .into()
-                        }
+                    .entry(namespace.clone())
+                    .or_insert_with(|| match namespace.clone() {
+                        RethRpcModule::Admin => AdminApi::new(
+                            self.network.clone(),
+                            self.provider.chain_spec(),
+                            self.pool.clone(),
+                        )
+                        .into_rpc()
+                        .into(),
                         RethRpcModule::Debug => {
                             DebugApi::new(eth_api.clone(), self.blocking_pool_guard.clone())
                                 .into_rpc()
@@ -953,14 +961,14 @@ where
                         RethRpcModule::Trace => TraceApi::new(
                             eth_api.clone(),
                             self.blocking_pool_guard.clone(),
-                            self.eth_config,
+                            self.eth_config.clone(),
                         )
                         .into_rpc()
                         .into(),
                         RethRpcModule::Web3 => Web3Api::new(self.network.clone()).into_rpc().into(),
                         RethRpcModule::Txpool => TxPoolApi::new(
                             self.eth.api.pool().clone(),
-                            self.eth.api.tx_resp_builder().clone(),
+                            dyn_clone::clone(self.eth.api.tx_resp_builder()),
                         )
                         .into_rpc()
                         .into(),
@@ -981,7 +989,9 @@ where
                         // only relevant for Ethereum and configured in `EthereumAddOns`
                         // implementation
                         // TODO: can we get rid of this here?
-                        RethRpcModule::Flashbots => Default::default(),
+                        // Custom modules are not handled here - they should be registered via
+                        // extend_rpc_modules
+                        RethRpcModule::Flashbots | RethRpcModule::Other(_) => Default::default(),
                         RethRpcModule::Miner => MinerApi::default().into_rpc().into(),
                         RethRpcModule::Mev => {
                             EthSimBundle::new(eth_api.clone(), self.blocking_pool_guard.clone())
@@ -1570,9 +1580,9 @@ impl TransportRpcModuleConfig {
             let ws_modules =
                 self.ws.as_ref().map(RpcModuleSelection::to_selection).unwrap_or_default();
 
-            let http_not_ws = http_modules.difference(&ws_modules).copied().collect();
-            let ws_not_http = ws_modules.difference(&http_modules).copied().collect();
-            let overlap = http_modules.intersection(&ws_modules).copied().collect();
+            let http_not_ws = http_modules.difference(&ws_modules).cloned().collect();
+            let ws_not_http = ws_modules.difference(&http_modules).cloned().collect();
+            let overlap = http_modules.intersection(&ws_modules).cloned().collect();
 
             Err(WsHttpSamePortError::ConflictingModules(Box::new(ConflictingModules {
                 overlap,
@@ -1708,7 +1718,7 @@ impl TransportRpcModules {
     /// Returns all unique endpoints installed for the given module.
     ///
     /// Note: In case of duplicate method names this only record the first occurrence.
-    pub fn methods_by_module<F>(&self, module: RethRpcModule) -> Methods {
+    pub fn methods_by_module(&self, module: RethRpcModule) -> Methods {
         self.methods_by(|name| name.starts_with(module.as_str()))
     }
 
@@ -1954,6 +1964,25 @@ impl TransportRpcModules {
         self.add_or_replace_http(other.clone())?;
         self.add_or_replace_ws(other.clone())?;
         self.add_or_replace_ipc(other)?;
+        Ok(())
+    }
+    /// Adds or replaces the given [`Methods`] in the transport modules where the specified
+    /// [`RethRpcModule`] is configured.
+    pub fn add_or_replace_if_module_configured(
+        &mut self,
+        module: RethRpcModule,
+        other: impl Into<Methods>,
+    ) -> Result<(), RegisterMethodError> {
+        let other = other.into();
+        if self.module_config().contains_http(&module) {
+            self.add_or_replace_http(other.clone())?;
+        }
+        if self.module_config().contains_ws(&module) {
+            self.add_or_replace_ws(other.clone())?;
+        }
+        if self.module_config().contains_ipc(&module) {
+            self.add_or_replace_ipc(other)?;
+        }
         Ok(())
     }
 }
@@ -2511,5 +2540,57 @@ mod tests {
         assert!(modules.http.as_ref().unwrap().method("anything").is_some());
         assert!(modules.ipc.as_ref().unwrap().method("anything").is_some());
         assert!(modules.ws.as_ref().unwrap().method("anything").is_some());
+    }
+
+    #[test]
+    fn test_add_or_replace_if_module_configured() {
+        // Create a config that enables RethRpcModule::Eth for HTTP and WS, but NOT IPC
+        let config = TransportRpcModuleConfig::default()
+            .with_http([RethRpcModule::Eth])
+            .with_ws([RethRpcModule::Eth]);
+
+        // Create HTTP module with an existing method (to test "replace")
+        let mut http_module = RpcModule::new(());
+        http_module.register_method("eth_existing", |_, _, _| "original").unwrap();
+
+        // Create WS module with the same existing method
+        let mut ws_module = RpcModule::new(());
+        ws_module.register_method("eth_existing", |_, _, _| "original").unwrap();
+
+        // Create IPC module (empty, to ensure no changes)
+        let ipc_module = RpcModule::new(());
+
+        // Set up TransportRpcModules with the config and modules
+        let mut modules = TransportRpcModules {
+            config,
+            http: Some(http_module),
+            ws: Some(ws_module),
+            ipc: Some(ipc_module),
+        };
+
+        // Create new methods: one to replace an existing method, one to add a new one
+        let mut new_module = RpcModule::new(());
+        new_module.register_method("eth_existing", |_, _, _| "replaced").unwrap(); // Replace
+        new_module.register_method("eth_new", |_, _, _| "added").unwrap(); // Add
+        let new_methods: Methods = new_module.into();
+
+        // Call the function for RethRpcModule::Eth
+        let result = modules.add_or_replace_if_module_configured(RethRpcModule::Eth, new_methods);
+        assert!(result.is_ok(), "Function should succeed");
+
+        // Verify HTTP: existing method still exists (replaced), new method added
+        let http = modules.http.as_ref().unwrap();
+        assert!(http.method("eth_existing").is_some());
+        assert!(http.method("eth_new").is_some());
+
+        // Verify WS: existing method still exists (replaced), new method added
+        let ws = modules.ws.as_ref().unwrap();
+        assert!(ws.method("eth_existing").is_some());
+        assert!(ws.method("eth_new").is_some());
+
+        // Verify IPC: no changes (Eth not configured for IPC)
+        let ipc = modules.ipc.as_ref().unwrap();
+        assert!(ipc.method("eth_existing").is_none());
+        assert!(ipc.method("eth_new").is_none());
     }
 }

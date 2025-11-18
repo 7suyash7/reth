@@ -1,13 +1,14 @@
 //! Implementation of the [`jsonrpsee`] generated [`EthApiServer`](crate::EthApi) trait
 //! Handles RPC requests for the `eth_` namespace.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use crate::{eth::helpers::types::EthRpcConverter, EthApiBuilder};
 use alloy_consensus::BlockHeader;
 use alloy_eips::BlockNumberOrTag;
 use alloy_network::Ethereum;
 use alloy_primitives::{Bytes, U256};
+use alloy_rpc_client::RpcClient;
 use derive_more::Deref;
 use reth_chainspec::{ChainSpec, ChainSpecProvider};
 use reth_evm_ethereum::EthEvmConfig;
@@ -20,8 +21,8 @@ use reth_rpc_eth_api::{
     EthApiTypes, RpcNodeCore,
 };
 use reth_rpc_eth_types::{
-    builder::config::PendingBlockKind, receipt::EthReceiptConverter, EthApiError, EthStateCache,
-    FeeHistoryCache, GasCap, GasPriceOracle, PendingBlock,
+    builder::config::PendingBlockKind, receipt::EthReceiptConverter, tx_forward::ForwardConfig,
+    EthApiError, EthStateCache, FeeHistoryCache, GasCap, GasPriceOracle, PendingBlock,
 };
 use reth_storage_api::{noop::NoopProvider, BlockReaderIdExt, ProviderHeader};
 use reth_tasks::{
@@ -29,8 +30,8 @@ use reth_tasks::{
     TaskSpawner, TokioTaskExecutor,
 };
 use reth_transaction_pool::{
-    noop::NoopTransactionPool, AddedTransactionOutcome, BatchTxProcessor, BatchTxRequest,
-    TransactionPool,
+    blobstore::BlobSidecarConverter, noop::NoopTransactionPool, AddedTransactionOutcome,
+    BatchTxProcessor, BatchTxRequest, TransactionPool,
 };
 use tokio::sync::{broadcast, mpsc, Mutex};
 
@@ -152,6 +153,9 @@ where
         rpc_converter: Rpc,
         max_batch_size: usize,
         pending_block_kind: PendingBlockKind,
+        raw_tx_forwarder: ForwardConfig,
+        send_raw_transaction_sync_timeout: Duration,
+        evm_memory_limit: u64,
     ) -> Self {
         let inner = EthApiInner::new(
             components,
@@ -168,6 +172,9 @@ where
             (),
             max_batch_size,
             pending_block_kind,
+            raw_tx_forwarder.forwarder_client(),
+            send_raw_transaction_sync_timeout,
+            evm_memory_limit,
         );
 
         Self { inner: Arc::new(inner) }
@@ -292,6 +299,9 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
     /// Transaction broadcast channel
     raw_tx_sender: broadcast::Sender<Bytes>,
 
+    /// Raw transaction forwarder
+    raw_tx_forwarder: Option<RpcClient>,
+
     /// Converter for RPC types.
     tx_resp_builder: Rpc,
 
@@ -304,6 +314,15 @@ pub struct EthApiInner<N: RpcNodeCore, Rpc: RpcConvert> {
 
     /// Configuration for pending block construction.
     pending_block_kind: PendingBlockKind,
+
+    /// Timeout duration for `send_raw_transaction_sync` RPC method.
+    send_raw_transaction_sync_timeout: Duration,
+
+    /// Blob sidecar converter
+    blob_sidecar_converter: BlobSidecarConverter,
+
+    /// Maximum memory the EVM can allocate per RPC request.
+    evm_memory_limit: u64,
 }
 
 impl<N, Rpc> EthApiInner<N, Rpc>
@@ -328,6 +347,9 @@ where
         next_env: impl PendingEnvBuilder<N::Evm>,
         max_batch_size: usize,
         pending_block_kind: PendingBlockKind,
+        raw_tx_forwarder: Option<RpcClient>,
+        send_raw_transaction_sync_timeout: Duration,
+        evm_memory_limit: u64,
     ) -> Self {
         let signers = parking_lot::RwLock::new(Default::default());
         // get the block number of the latest block
@@ -363,10 +385,14 @@ where
             fee_history_cache,
             blocking_task_guard: BlockingTaskGuard::new(proof_permits),
             raw_tx_sender,
+            raw_tx_forwarder,
             tx_resp_builder,
             next_env_builder: Box::new(next_env),
             tx_batch_sender,
             pending_block_kind,
+            send_raw_transaction_sync_timeout,
+            blob_sidecar_converter: BlobSidecarConverter::new(),
+            evm_memory_limit,
         }
     }
 }
@@ -526,6 +552,30 @@ where
     pub const fn pending_block_kind(&self) -> PendingBlockKind {
         self.pending_block_kind
     }
+
+    /// Returns a handle to the raw transaction forwarder.
+    #[inline]
+    pub const fn raw_tx_forwarder(&self) -> Option<&RpcClient> {
+        self.raw_tx_forwarder.as_ref()
+    }
+
+    /// Returns the timeout duration for `send_raw_transaction_sync` RPC method.
+    #[inline]
+    pub const fn send_raw_transaction_sync_timeout(&self) -> Duration {
+        self.send_raw_transaction_sync_timeout
+    }
+
+    /// Returns a handle to the blob sidecar converter.
+    #[inline]
+    pub const fn blob_sidecar_converter(&self) -> &BlobSidecarConverter {
+        &self.blob_sidecar_converter
+    }
+
+    /// Returns the EVM memory limit.
+    #[inline]
+    pub const fn evm_memory_limit(&self) -> u64 {
+        self.evm_memory_limit
+    }
 }
 
 #[cfg(test)]
@@ -674,7 +724,7 @@ mod tests {
     /// Invalid block range
     #[tokio::test]
     async fn test_fee_history_empty() {
-        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _>>::fee_history(
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::fee_history(
             &build_test_eth_api(NoopProvider::default()),
             U64::from(1),
             BlockNumberOrTag::Latest,
@@ -696,7 +746,7 @@ mod tests {
         let (eth_api, _, _) =
             prepare_eth_api(newest_block, oldest_block, block_count, MockEthProvider::default());
 
-        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _>>::fee_history(
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::fee_history(
             &eth_api,
             U64::from(newest_block + 1),
             newest_block.into(),
@@ -719,7 +769,7 @@ mod tests {
         let (eth_api, _, _) =
             prepare_eth_api(newest_block, oldest_block, block_count, MockEthProvider::default());
 
-        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _>>::fee_history(
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::fee_history(
             &eth_api,
             U64::from(1),
             (newest_block + 1000).into(),
@@ -742,7 +792,7 @@ mod tests {
         let (eth_api, _, _) =
             prepare_eth_api(newest_block, oldest_block, block_count, MockEthProvider::default());
 
-        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _>>::fee_history(
+        let response = <EthApi<_, _> as EthApiServer<_, _, _, _, _, _>>::fee_history(
             &eth_api,
             U64::from(0),
             newest_block.into(),
